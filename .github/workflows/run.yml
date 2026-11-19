@@ -48,43 +48,38 @@ jobs:
           python-version: '3.10'
           cache: pip
 
+      # main.py 会按当前时间比例缩放步数，这里反向换算，
+      # 保证最终刷的就是用户填的值。只用户提交且填了步数时才执行。
+      - name: 计算目标步数
+        if: github.event.inputs.user != '' && github.event.inputs.pwd != '' && github.event.inputs.steps != ''
+        env:
+          IN_STEPS: ${{ github.event.inputs.steps }}
+        run: |
+          H=$(TZ=Asia/Shanghai date +%H)
+          M=$(TZ=Asia/Shanghai date +%M)
+          RATE=$(awk -v h="$H" -v m="$M" 'BEGIN{r=(h*60+m)/1320; if(r>1)r=1; if(r<0.02)r=0.02; printf "%.6f", r}')
+          VAL=$(awk -v s="$IN_STEPS" -v r="$RATE" 'BEGIN{v=int(s/r+0.5); if(v<1)v=1; print v}')
+          {
+            echo "MIN_STEP=$VAL"
+            echo "MAX_STEP=$VAL"
+          } >> "$GITHUB_ENV"
+
       - name: 开始
         env:
           CONFIG: ${{ secrets.CONFIG }}
           AES_KEY: ${{ secrets.AES_KEY }}
           IN_USER: ${{ github.event.inputs.user }}
           IN_PWD: ${{ github.event.inputs.pwd }}
-          IN_STEPS: ${{ github.event.inputs.steps }}
         run: |
           pip3 install -r requirements.txt
 
           if [ -n "$IN_USER" ] && [ -n "$IN_PWD" ]; then
             # 用户提交：不使用仓库里的 CONFIG / 不持久化 token
-            echo "::add-mask::$IN_PWD"   # 防止密码意外出现在日志里
+            echo "::add-mask::$IN_PWD"
             unset CONFIG
             unset AES_KEY
             export USER="$IN_USER"
             export PWD="$IN_PWD"
-
-            if [ -n "$IN_STEPS" ]; then
-              # main.py 会按当前时间比例缩放步数，这里反向换算，保证结果等于用户填的值
-              eval "$(python3 - <<'PY'
-import datetime, os
-try:
-    import pytz
-    now = datetime.datetime.now(pytz.timezone("Asia/Shanghai"))
-except Exception:
-    now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-
-rate = min((now.hour * 60 + now.minute) / (22 * 60), 1.0)
-rate = max(rate, 0.02)  # 避免 0 点附近除零
-target = max(1, int(os.environ["IN_STEPS"]))
-val = max(1, round(target / rate))
-print(f"export MIN_STEP={val}")
-print(f"export MAX_STEP={val}")
-PY
-)"
-            fi
           fi
 
           python3 main.py
