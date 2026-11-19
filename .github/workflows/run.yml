@@ -1,41 +1,99 @@
+# 把这个文件的内容覆盖到仓库的 .github/workflows/run.yml
+#
+# 改动点：
+# 1. workflow_dispatch 增加 user / pwd / steps 三个输入
+# 2. 带输入时用 USER/PWD 环境变量（main.py 原生支持），不再读 CONFIG
+# 3. 带输入时按当前时间反算 MIN/MAX_STEP，保证最终刷的就是用户填的步数
+# 4. 只有定时任务才提交 encrypted_tokens.data，用户提交不走持久化
+
 name: 刷步数
 
 on:
   schedule:
     - cron: '9 10,12,14 * * *'
   workflow_dispatch:
+    inputs:
+      user:
+        description: 'Zepp 账号（留空则用仓库 CONFIG）'
+        required: false
+        default: ''
+      pwd:
+        description: 'Zepp 密码（留空则用仓库 CONFIG）'
+        required: false
+        default: ''
+      steps:
+        description: '目标步数（留空则按 CONFIG 的 MIN/MAX 随机）'
+        required: false
+        default: ''
+
+# 同一时间只跑一个，避免多个任务同时登录 Zepp 触发风控
+concurrency:
+  group: mimotion
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
+
     steps:
       - name: Checkout codes
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PAT }} #此处PAT需要申请，教程详见：README
-      - name: Update system and install zsh
-        run: |
-          sudo -E apt-get -qq update
-          sudo -E apt-get install zsh -y
-          
+          token: ${{ secrets.PAT }}
+
       - name: 初始化Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          
+          python-version: '3.10'
+          cache: pip
+
       - name: 开始
         env:
-            CONFIG: ${{ secrets.CONFIG }}
-            AES_KEY: ${{ secrets.AES_KEY }}
+          CONFIG: ${{ secrets.CONFIG }}
+          AES_KEY: ${{ secrets.AES_KEY }}
+          IN_USER: ${{ github.event.inputs.user }}
+          IN_PWD: ${{ github.event.inputs.pwd }}
+          IN_STEPS: ${{ github.event.inputs.steps }}
         run: |
           pip3 install -r requirements.txt
+
+          if [ -n "$IN_USER" ] && [ -n "$IN_PWD" ]; then
+            # 用户提交：不使用仓库里的 CONFIG / 不持久化 token
+            echo "::add-mask::$IN_PWD"   # 防止密码意外出现在日志里
+            unset CONFIG
+            unset AES_KEY
+            export USER="$IN_USER"
+            export PWD="$IN_PWD"
+
+            if [ -n "$IN_STEPS" ]; then
+              # main.py 会按当前时间比例缩放步数，这里反向换算，保证结果等于用户填的值
+              eval "$(python3 - <<'PY'
+import datetime, os
+try:
+    import pytz
+    now = datetime.datetime.now(pytz.timezone("Asia/Shanghai"))
+except Exception:
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
+rate = min((now.hour * 60 + now.minute) / (22 * 60), 1.0)
+rate = max(rate, 0.02)  # 避免 0 点附近除零
+target = max(1, int(os.environ["IN_STEPS"]))
+val = max(1, round(target / rate))
+print(f"export MIN_STEP={val}")
+print(f"export MAX_STEP={val}")
+PY
+)"
+            fi
+          fi
+
           python3 main.py
 
       - name: persist tokens
+        if: github.event_name == 'schedule'
         run: |
           git config user.name github-actions
           git config user.email github-actions@users.noreply.github.com
-          git add .
-          git commit -m "persist tokens trigger by ${{ github.event_name }}"
+          git add -A
+          git diff --cached --quiet || git commit -m "persist tokens trigger by schedule"
           git push origin master
